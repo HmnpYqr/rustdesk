@@ -2424,6 +2424,32 @@ error:
 	return res;
 }
 
+/* Reads the size of a file by name, for entries whose descriptor carries no FD_FILESIZE and
+   whose stored size fields therefore hold nothing usable. Directories are not opened here:
+   without FILE_FLAG_BACKUP_SEMANTICS CreateFileW refuses them, and a directory has no size to
+   answer with. */
+static BOOL wf_cliprdr_get_file_size(WCHAR *file_name, LARGE_INTEGER *size)
+{
+	BOOL res;
+	HANDLE hFile;
+
+	if (!file_name || !size)
+		return FALSE;
+
+	hFile = CreateFileW(file_name, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+						FILE_ATTRIBUTE_NORMAL, NULL);
+
+	if (hFile == INVALID_HANDLE_VALUE)
+		return FALSE;
+
+	res = GetFileSizeEx(hFile, size) && size->QuadPart >= 0;
+
+	if (!CloseHandle(hFile))
+		res = FALSE;
+
+	return res;
+}
+
 /* path_name has a '\' at the end. e.g. c:\newfolder\, file_name is c:\newfolder\new.txt */
 static FILEDESCRIPTORW *wf_cliprdr_get_file_descriptor(WCHAR *file_name, size_t pathLen)
 {
@@ -3534,15 +3560,38 @@ wf_cliprdr_server_file_contents_request(CliprdrClientContext *context,
 	{
 		if (fileContentsRequest->dwFlags == FILECONTENTS_SIZE)
 		{
+			FILEDESCRIPTORW *fd;
+
 			if (clipboard->nFiles <= fileContentsRequest->listIndex)
 			{
 				rc = ERROR_INTERNAL_ERROR;
 				goto exit;
 			}
-			*((UINT32 *)&pData[0]) =
-				clipboard->fileDescriptor[fileContentsRequest->listIndex]->nFileSizeLow;
-			*((UINT32 *)&pData[4]) =
-				clipboard->fileDescriptor[fileContentsRequest->listIndex]->nFileSizeHigh;
+
+			fd = clipboard->fileDescriptor[fileContentsRequest->listIndex];
+			// The stored size fields only mean anything when FD_FILESIZE says so. Reporting
+			// them regardless would answer with zero for an entry whose size could not be
+			// read, describing a file that has content as empty, so read it from the file
+			// and fail the request if even that does not yield one.
+			if ((fd->dwFlags & FD_FILESIZE) == 0)
+			{
+				LARGE_INTEGER file_size = {0};
+
+				if (!wf_cliprdr_get_file_size(
+						clipboard->file_names[fileContentsRequest->listIndex], &file_size))
+				{
+					rc = ERROR_INTERNAL_ERROR;
+					goto exit;
+				}
+
+				*((UINT32 *)&pData[0]) = file_size.LowPart;
+				*((UINT32 *)&pData[4]) = (DWORD)file_size.HighPart;
+			}
+			else
+			{
+				*((UINT32 *)&pData[0]) = fd->nFileSizeLow;
+				*((UINT32 *)&pData[4]) = fd->nFileSizeHigh;
+			}
 			uSize = cbRequested;
 		}
 		else if (fileContentsRequest->dwFlags == FILECONTENTS_RANGE)
