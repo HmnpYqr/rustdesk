@@ -1,0 +1,269 @@
+name: Build custom RustDesk Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-android-custom.yml'
+
+permissions:
+  contents: read
+
+env:
+  # 全部取自上游 flutter-build.yml / bridge.yml 的锁定版本
+  RUST_VERSION: "1.75"
+  CARGO_NDK_VERSION: "3.1.2"
+  NDK_VERSION: "r28c"
+  ANDROID_FLUTTER_VERSION: "3.24.5"
+  BRIDGE_FLUTTER_VERSION: "3.22.3"
+  CARGO_EXPAND_VERSION: "1.0.95"
+  FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  OLD_APP_ID: "com.carriez.flutter_hbb"
+  NEW_APP_ID: "com.rdcustom.client"
+  APP_VERSION_NAME: "1.4.9"
+
+jobs:
+  # ---------- 1. 生成 flutter-rust-bridge 代码（gitignore 文件，必须先有） ----------
+  bridge:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ca-certificates clang cmake curl gcc git g++ libclang-dev libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-unknown-linux-gnu
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: bridge-only
+
+      - name: Install Flutter ${{ env.BRIDGE_FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.BRIDGE_FLUTTER_VERSION }}
+          cache: true
+
+      - name: Install codegen tools
+        run: |
+          cargo install cargo-expand --version ${{ env.CARGO_EXPAND_VERSION }} --locked
+          cargo install flutter_rust_bridge_codegen --version ${{ env.FLUTTER_RUST_BRIDGE_VERSION }} --features "uuid" --locked
+
+      - name: Prepare flutter deps
+        run: |
+          sed -i -e 's/extended_text: 14.0.0/extended_text: 13.0.0/g' flutter/pubspec.yaml
+          pushd flutter && flutter pub get && popd
+
+      - name: Generate bridge
+        run: |
+          ~/.cargo/bin/flutter_rust_bridge_codegen \
+            --rust-input ./src/flutter_ffi.rs \
+            --dart-output ./flutter/lib/generated_bridge.dart \
+            --c-output ./flutter/macos/Runner/bridge_generated.h
+          mkdir -p ./flutter/ios/Runner
+          cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
+
+      - name: Verify outputs exist
+        run: ls -l ./src/bridge_generated.rs ./src/bridge_generated.io.rs ./flutter/lib/generated_bridge.dart ./flutter/lib/generated_bridge.freezed.dart
+
+      - name: Upload bridge artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-artifact
+          if-no-files-found: error
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
+
+  # ---------- 2. 编译 arm64 APK 并用自制 keystore 签名 ----------
+  apk:
+    needs: bridge
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Free disk space (safe subset)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/system-images /usr/local/lib/android/sdk/ndk/2[0-6]* 2>/dev/null || true
+          df -h /
+
+      - name: Install Flutter ${{ env.ANDROID_FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
+          cache: true
+
+      - name: Patch Flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          if [[ "${{ env.ANDROID_FLUTTER_VERSION }}" == "3.24.5" ]]; then
+            git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
+
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: Ensure Android SDK components
+        run: |
+          SDKM="$(command -v sdkmanager || echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager")"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "platforms;android-36" "build-tools;36.0.0" "platform-tools" > /dev/null || true
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies (arm64-v8a)
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          if ! ./flutter/build_android_deps.sh arm64-v8a; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r f; do
+              echo "=== $f ==="; tail -n 200 "$f"; echo ""
+            done
+            exit 1
+          fi
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rustdesk-lib-cache-android
+          key: aarch64-linux-android
+
+      - name: Rename package (applicationId / namespace / kotlin 包)
+        shell: bash
+        run: |
+          set -e
+          OLD="${{ env.OLD_APP_ID }}"
+          NEW="${{ env.NEW_APP_ID }}"
+          OLDPATH="$(echo "$OLD" | tr '.' '/')"
+          NEWPATH="$(echo "$NEW" | tr '.' '/')"
+
+          # 1) gradle 与三个 manifest
+          sed -i "s/${OLD}/${NEW}/g" \
+            flutter/android/app/build.gradle \
+            flutter/android/app/src/main/AndroidManifest.xml \
+            flutter/android/app/src/debug/AndroidManifest.xml \
+            flutter/android/app/src/profile/AndroidManifest.xml
+
+          # 2) 所有 kotlin 源文件的 package/import
+          KT_DIR=flutter/android/app/src/main/kotlin
+          find "$KT_DIR" -name '*.kt' -print0 | xargs -0 sed -i "s/${OLD}/${NEW}/g"
+
+          # 3) kotlin 包目录改名
+          mkdir -p "$KT_DIR/$NEWPATH"
+          if [ -d "$KT_DIR/$OLDPATH" ]; then
+            mv "$KT_DIR/$OLDPATH"/* "$KT_DIR/$NEWPATH"/
+            rmdir "$KT_DIR/$OLDPATH" || true
+          fi
+
+          # 4) Gradle 内存（照抄上游）
+          sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
+
+          # 5) release 构建改用 debug 签名（照抄上游），真正的签名交给后面的 apksigner
+          sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
+
+          echo "--- 校验改名结果 ---"
+          grep -rn "applicationId\|namespace " flutter/android/app/build.gradle | head -5
+          grep -rn "package " "$KT_DIR/$NEWPATH"/*.kt | head -5
+
+      - name: Build rustdesk native lib (arm64)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          rustup target add aarch64-linux-android
+          cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
+          ./flutter/ndk_arm64.sh
+          mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
+          cp ./target/aarch64-linux-android/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+          cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" ./flutter/android/app/src/main/jniLibs/arm64-v8a/
+          "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" ./flutter/android/app/src/main/jniLibs/arm64-v8a/*
+
+      - name: Build APK
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cd flutter
+          flutter pub get
+          flutter build apk --release \
+            --target-platform android-arm64 \
+            --build-name=${{ env.APP_VERSION_NAME }} \
+            --build-number=${{ github.run_number }}
+          ls -l build/app/outputs/flutter-apk/
+
+      - name: Sign APK with our keystore
+        env:
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -e
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/custom-release.p12"
+          ls -l "$RUNNER_TEMP/custom-release.p12"
+
+          BT="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* | sort -V | tail -1)"
+          echo "build-tools: $BT"
+
+          IN=flutter/build/app/outputs/flutter-apk/app-release.apk
+          OUT="$RUNNER_TEMP/rustdesk-custom-arm64.apk"
+          "$BT/apksigner" sign \
+            --ks "$RUNNER_TEMP/custom-release.p12" \
+            --ks-type PKCS12 \
+            --ks-key-alias "$KS_ALIAS" \
+            --ks-pass env:KS_PASS \
+            --key-pass env:KEY_PASS \
+            --out "$OUT" "$IN"
+
+          echo "--- 签名校验（应看到 CN=RD Custom） ---"
+          "$BT/apksigner" verify --print-certs "$OUT" | head -8
+          echo "--- 包名 / 版本 校验 ---"
+          "$BT/aapt2" dump badging "$OUT" | head -3
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-custom-arm64-signed
+          if-no-files-found: error
+          path: ${{ runner.temp }}/rustdesk-custom-arm64.apk
