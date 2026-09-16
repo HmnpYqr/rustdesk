@@ -19,7 +19,8 @@ env:
   CARGO_EXPAND_VERSION: "1.0.95"
   FLUTTER_RUST_BRIDGE_VERSION: "1.80.1"
   VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
-  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  # 显式用 files 提供者做二进制缓存，交给 actions/cache 保存（x-gha 在 CI 上会报 400）
+  VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/vcpkg-bincache,readwrite"
   OLD_APP_ID: "com.carriez.flutter_hbb"
   NEW_APP_ID: "com.rdcustom.client"
   APP_VERSION_NAME: "1.4.9"
@@ -107,6 +108,17 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/system-images /usr/local/lib/android/sdk/ndk/2[0-6]* 2>/dev/null || true
           df -h /
 
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            autoconf automake libtool pkg-config \
+            nasm yasm ninja-build cmake \
+            curl wget git zip unzip tar \
+            perl python3 build-essential \
+            libclang-dev llvm-dev
+          echo "nasm: $(nasm -v | head -1)"
+
       - name: Install Flutter ${{ env.ANDROID_FLUTTER_VERSION }}
         uses: subosito/flutter-action@v2
         with:
@@ -138,7 +150,13 @@ jobs:
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
-          doNotCache: false
+          doNotCache: true
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-bincache
+          key: vcpkg-arm64-android-${{ env.VCPKG_COMMIT_ID }}-v1
 
       - name: Install vcpkg dependencies (arm64-v8a)
         shell: bash
@@ -146,7 +164,9 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
+          mkdir -p vcpkg-bincache
           if ! ./flutter/build_android_deps.sh arm64-v8a; then
+            echo "===== vcpkg 日志（末尾 200 行） ====="
             find "${VCPKG_ROOT}/" -name "*.log" | while read -r f; do
               echo "=== $f ==="; tail -n 200 "$f"; echo ""
             done
